@@ -1,0 +1,16 @@
+name: tmp-verify-scout-logs
+on: push
+jobs:
+  verify-scout-logs:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      RUST_MIN_STACK_SIZE: 8388608
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust
+        with:
+          install-nextest: "false"
+      - run: cargo fmt -p chroma-log -- --check
+      - run: cargo test -p chroma-log --lib scout_logs
