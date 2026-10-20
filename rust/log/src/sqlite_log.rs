@@ -27,8 +27,6 @@ pub enum SqlitePullLogsError {
     InvalidEmbedding(bytemuck::PodCastError),
     #[error("Failed to parse metadata: {0}")]
     InvalidMetadata(#[from] serde_json::Error),
-    #[error("Method {0} is not implemented")]
-    NotImplemented(String),
 }
 
 impl ChromaError for SqlitePullLogsError {
@@ -38,7 +36,6 @@ impl ChromaError for SqlitePullLogsError {
             SqlitePullLogsError::InvalidEncoding(_) => ErrorCodes::InvalidArgument,
             SqlitePullLogsError::InvalidEmbedding(_) => ErrorCodes::InvalidArgument,
             SqlitePullLogsError::InvalidMetadata(_) => ErrorCodes::InvalidArgument,
-            SqlitePullLogsError::NotImplemented(_) => ErrorCodes::Internal,
         }
     }
 }
@@ -187,12 +184,24 @@ impl SqliteLog {
 
     pub(super) async fn scout_logs(
         &mut self,
-        _collection_id: CollectionUuid,
-        _starting_offset: i64,
+        collection_id: CollectionUuid,
+        starting_offset: i64,
     ) -> Result<u64, SqlitePullLogsError> {
-        Err(SqlitePullLogsError::NotImplemented(
-            "scout_logs".to_string(),
-        ))
+        let topic =
+            get_embeddings_queue_topic_name(&self.tenant_id, &self.topic_namespace, collection_id);
+
+        // `seq_id` is assigned by the queue, so the first uninserted record is
+        // one past the largest `seq_id` for this collection's topic.
+        let max_seq_id: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(seq_id) FROM embeddings_queue WHERE topic = ?")
+                .bind(topic)
+                .fetch_one(self.db.get_conn())
+                .await
+                .map_err(WrappedSqlxError)?;
+
+        Ok(max_seq_id
+            .map_or(starting_offset, |seq_id| seq_id + 1)
+            .max(starting_offset) as u64)
     }
 
     pub(super) async fn read(
@@ -766,6 +775,41 @@ mod tests {
             .unwrap();
         let collections_with_data = log.get_collections_with_new_data(0).await.unwrap();
         assert_eq!(collections_with_data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_scout_logs() {
+        let mut log = setup_sqlite_log().await;
+        let collection_id = CollectionUuid::new();
+
+        // An empty log reports the requested offset.
+        assert_eq!(log.scout_logs(collection_id, 0).await.unwrap(), 0);
+        assert_eq!(log.scout_logs(collection_id, 7).await.unwrap(), 7);
+
+        let record = |id: &str| OperationRecord {
+            id: id.to_string(),
+            embedding: Some(vec![1.0, 2.0, 3.0]),
+            encoding: Some(ScalarEncoding::FLOAT32),
+            metadata: None,
+            document: None,
+            operation: Operation::Add,
+        };
+
+        log.push_logs(collection_id, vec![record("a"), record("b")])
+            .await
+            .unwrap();
+        // Two records with seq_id 1 and 2: the next uninserted offset is 3.
+        assert_eq!(log.scout_logs(collection_id, 0).await.unwrap(), 3);
+        assert_eq!(log.scout_logs(collection_id, 1).await.unwrap(), 3);
+
+        // Another collection's records do not affect this collection, and an
+        // offset past the end of the log is preserved.
+        let other_collection_id = CollectionUuid::new();
+        log.push_logs(other_collection_id, vec![record("c")])
+            .await
+            .unwrap();
+        assert_eq!(log.scout_logs(collection_id, 0).await.unwrap(), 3);
+        assert_eq!(log.scout_logs(collection_id, 10).await.unwrap(), 10);
     }
 
     #[tokio::test]
